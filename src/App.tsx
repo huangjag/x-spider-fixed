@@ -63,7 +63,9 @@ export const App: React.FC = () => {
                 <>
                   <CloseCircleFilled className="text-5xl text-ant-color-error" />
                   <p className="mt-4 text-xl">应用启动失败，请尝试重启应用</p>
-                  <p className="text-gray-600 mt-2">{error || '未知错误'}</p>
+                  <p className="text-gray-600 mt-2 max-w-xl break-words text-center">
+                    {error || '未知错误'}
+                  </p>
                 </>
               )}
             </div>

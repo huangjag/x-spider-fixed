@@ -1,5 +1,6 @@
 import { Child, Command } from '@tauri-apps/api/shell';
 import { EventEmitter } from './event';
+import { delay } from './index';
 import * as R from 'ramda';
 
 export enum AriaStatus {
@@ -20,13 +21,28 @@ export interface AriaTask {
 
 export type AriaGid = string;
 
+const START_PORTS = [6801, 8000];
+const PORTS_PER_RANGE = 10;
+const LISTEN_TIMEOUT = 10_000;
+const WS_TIMEOUT = 5_000;
+const RETRY_GAP = 300;
+const TOTAL_DEADLINE = 60_000;
+
+const PORT_CANDIDATES = START_PORTS.flatMap((start) =>
+  Array.from({ length: PORTS_PER_RANGE }, (_, i) => start + i),
+);
+const PORT_RANGE_DESC = START_PORTS.map(
+  (start) => `${start}-${start + PORTS_PER_RANGE - 1}`,
+).join('、');
+
 class Aria2 {
   #ready = false;
   get ready() {
     return this.#ready;
   }
   #secret = crypto.randomUUID();
-  #port = 6801;
+  #port = START_PORTS[0];
+  #bound = false;
   #ws?: WebSocket;
   #command?: Command;
   #child?: Child;
@@ -54,9 +70,43 @@ class Aria2 {
     if (this.#ready) throw new Error('Aria2 is already ready');
 
     this.#log = log.category('ARIA');
-    /**
-     * 启动 Aria2c 子进程
-     */
+
+    if (!this.#bound) {
+      this.#bound = true;
+      window.addEventListener('beforeunload', this.#onBeforeUnload);
+    }
+
+    const deadline = Date.now() + TOTAL_DEADLINE;
+    let lastError = '';
+    let deadlineExceeded = false;
+
+    for (const port of PORT_CANDIDATES) {
+      if (Date.now() >= deadline) {
+        deadlineExceeded = true;
+        break;
+      }
+      this.#port = port;
+      try {
+        await this.#startOnce();
+        this.#command!.stderr.on('data', this.#onStderr);
+        this.#ws!.addEventListener('message', this.#onWsMessage);
+        return;
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
+        this.#log?.warn(`Bootstrap failed on port ${port}:`, lastError);
+        await this.#cleanup();
+        await delay(RETRY_GAP);
+      }
+    }
+
+    throw new Error(
+      deadlineExceeded
+        ? `Aria2 启动失败：超过 ${TOTAL_DEADLINE / 1000}s 总时限。最后错误：${lastError}`
+        : `Aria2 启动失败：端口 ${PORT_RANGE_DESC} 均不可用。最后错误：${lastError}`,
+    );
+  }
+
+  async #startOnce() {
     const args = [
       '--enable-rpc',
       '--rpc-secret',
@@ -65,65 +115,126 @@ class Aria2 {
       this.#port.toString(),
     ];
     this.#command = Command.sidecar('binaries/aria2c', args);
-    this.#log.info('Spawn with args:', args);
+    this.#log?.info('Spawn with args:', args);
     this.#child = await this.#command.spawn();
     this.#log?.info('Wait for listening...');
-    await new Promise((resolve, reject) => {
+    await this.#waitListening();
+    this.#log?.info('Connecting websocket...');
+    await this.#connectWs();
+    this.#ready = true;
+  }
+
+  #waitListening() {
+    const command = this.#command!;
+    const port = this.#port;
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (err?: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        command.stdout.removeListener('data', onStdout);
+        command.stderr.removeListener('data', onStderr);
+        command.removeListener('close', onClose);
+        command.removeListener('error', onError);
+        if (err) reject(err);
+        else resolve();
+      };
       const onStdout = (message: string) => {
-        if (
-          !this.ready &&
-          message.includes('IPv4 RPC: listening on TCP port')
+        if (message.includes('IPv4 RPC: listening on TCP port')) {
+          this.#log?.info(`Aria2 listening on port ${port}`);
+          finish();
+        } else if (
+          message.includes('[ERROR]') ||
+          message.includes('failed to bind') ||
+          message.includes('Failed to setup RPC server')
         ) {
-          this.#log?.info('Child process launched');
-          this.#command!.stdout.removeListener('data', onStdout);
-          this.#command!.stdout.removeListener('data', onStderr);
-          resolve(null);
+          finish(new Error(`Aria2 端口 ${port} 启动失败：${message}`));
         }
       };
       const onStderr = (message: string) => {
-        this.#command!.stdout.removeListener('data', onStdout);
-        this.#command!.stdout.removeListener('data', onStderr);
-        reject(new Error(message));
+        finish(new Error(`Aria2 端口 ${port} stderr：${message}`));
       };
-      this.#command!.stdout.on('data', onStdout);
-      this.#command!.stderr.on('data', onStderr);
-    });
-
-    /**
-     * 连接 Websocket
-     */
-    this.#log.info('Connecting websocket...');
-    this.#ws = new WebSocket(`ws://127.0.0.1:${this.#port}/jsonrpc`);
-    await new Promise((resolve, reject) => {
-      const onError = (ev: any) => {
-        this.#log?.error('Failed to connect websocket', ev);
-        reject(new Error('Failed to connect websocket'));
+      const onClose = (payload: { code?: number | null }) => {
+        finish(
+          new Error(`Aria2 进程提前退出（code=${payload.code}），端口 ${port}`),
+        );
       };
-      this.#ws!.addEventListener(
-        'open',
-        () => {
-          this.#log?.info('Websocket connected');
-          this.#ready = true;
-          this.#ws!.removeEventListener('error', onError);
-          resolve(null);
-        },
-        { once: true },
-      );
-      this.#ws!.addEventListener('error', onError, { once: true });
-    });
+      const onError = (err: string) => {
+        finish(new Error(`Aria2 进程错误，端口 ${port}：${err}`));
+      };
+      const timer = setTimeout(() => {
+        finish(
+          new Error(
+            `等待 Aria2 监听超时（${LISTEN_TIMEOUT / 1000}s），端口 ${port}`,
+          ),
+        );
+      }, LISTEN_TIMEOUT);
 
-    /**
-     * 绑定一些事件
-     */
-    window.addEventListener('beforeunload', this.#onBeforeUnload);
-    this.#command.stderr.on('data', this.#onStderr);
-    this.#ws.addEventListener('message', this.#onWsMessage);
+      command.stdout.on('data', onStdout);
+      command.stderr.on('data', onStderr);
+      command.on('close', onClose);
+      command.on('error', onError);
+    });
+  }
+
+  #connectWs() {
+    const port = this.#port;
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/jsonrpc`);
+    this.#ws = ws;
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (err?: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        ws.removeEventListener('open', onOpen);
+        ws.removeEventListener('error', onError);
+        if (err) reject(err);
+        else resolve();
+      };
+      const onOpen = () => {
+        this.#log?.info('Websocket connected');
+        finish();
+      };
+      const onError = () => {
+        finish(new Error(`连接 Aria2 WebSocket 失败，端口 ${port}`));
+      };
+      const timer = setTimeout(() => {
+        finish(
+          new Error(
+            `连接 Aria2 WebSocket 超时（${WS_TIMEOUT / 1000}s），端口 ${port}`,
+          ),
+        );
+      }, WS_TIMEOUT);
+
+      ws.addEventListener('open', onOpen);
+      ws.addEventListener('error', onError);
+    });
+  }
+
+  async #cleanup() {
+    try {
+      this.#ws?.close();
+    } catch (err) {
+      this.#log?.warn('Cleanup: close websocket failed:', err);
+    }
+    try {
+      await this.#child?.kill();
+    } catch (err) {
+      this.#log?.warn('Cleanup: kill child failed:', err);
+    }
+    this.#ws = undefined;
+    this.#child = undefined;
+    this.#command = undefined;
   }
 
   #_onBeforeUnload() {
     this.#log?.info('Window before unload');
-    this.#ws!.close();
-    this.#child!.kill();
+    this.#ws?.close();
+    this.#child?.kill().catch((err) => {
+      this.#log?.warn('Beforeunload: kill child failed:', err);
+    });
   }
 
   #_onStderr(message: string) {

@@ -19,7 +19,10 @@ export function useBootstrap() {
               await aria2.bootstrap();
             } catch (err) {
               log.error(err);
-              throw new Error('启动 Aria 失败 ');
+              throw new Error(
+                '启动 Aria 失败：' +
+                  (err instanceof Error ? err.message : String(err)),
+              );
             }
           },
         },

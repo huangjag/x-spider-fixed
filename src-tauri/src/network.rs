@@ -111,15 +111,77 @@ pub async fn network_fetch(
 
 #[tauri::command]
 pub async fn network_get_system_proxy_url() -> Result<HashMap<String, String>, ()> {
-  let proxies = reqwest::get_system_proxy_map();
-  let mut mapped_proxies: HashMap<String, String> = HashMap::with_capacity(proxies.len());
+  let mut proxies: HashMap<String, String> = HashMap::new();
 
-  for (key, value) in proxies {
-    mapped_proxies.insert(key.clone(), match value {
-      reqwest::ProxyScheme::Http { host, .. } => host.to_string(),
-      reqwest::ProxyScheme::Https { host, .. } => host.to_string(),
-    });
+  for (scheme, keys) in [
+    ("https", ["HTTPS_PROXY", "https_proxy"]),
+    ("http", ["HTTP_PROXY", "http_proxy"]),
+  ] {
+    for key in keys {
+      if let Ok(value) = std::env::var(key) {
+        if !value.trim().is_empty() {
+          proxies.insert(scheme.to_string(), proxy_authority(&value));
+          break;
+        }
+      }
+    }
   }
 
-  Ok(mapped_proxies)
+  #[cfg(windows)]
+  if proxies.is_empty() {
+    if let Some(map) = read_windows_system_proxy() {
+      proxies = map;
+    }
+  }
+
+  Ok(proxies)
+}
+
+fn proxy_authority(value: &str) -> String {
+  let value = value.trim();
+  let value = value.split("://").last().unwrap_or(value);
+  value.trim_end_matches('/').to_string()
+}
+
+#[cfg(windows)]
+fn read_windows_system_proxy() -> Option<HashMap<String, String>> {
+  use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
+  use winreg::RegKey;
+
+  let key = RegKey::predef(HKEY_CURRENT_USER)
+    .open_subkey_with_flags(
+      "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
+      KEY_READ,
+    )
+    .ok()?;
+
+  if key.get_value::<u32, _>("ProxyEnable").ok()? == 0 {
+    return Some(HashMap::new());
+  }
+  let server: String = key.get_value("ProxyServer").ok()?;
+  Some(parse_proxy_server(&server))
+}
+
+#[cfg(windows)]
+fn parse_proxy_server(server: &str) -> HashMap<String, String> {
+  let mut map = HashMap::new();
+  let server = server.trim();
+  if server.is_empty() {
+    return map;
+  }
+  if server.contains('=') {
+    for part in server.split(';') {
+      if let Some((proto, addr)) = part.split_once('=') {
+        let proto = proto.trim().to_lowercase();
+        let addr = addr.trim();
+        if (proto == "http" || proto == "https") && !addr.is_empty() {
+          map.insert(proto, addr.to_string());
+        }
+      }
+    }
+  } else {
+    map.insert("http".to_string(), server.to_string());
+    map.insert("https".to_string(), server.to_string());
+  }
+  map
 }
