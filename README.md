@@ -1,3 +1,11 @@
+# 此版本为个人修订版
+
+bug修复：修复了aria2c.exe所使用端口可能被windows进程占用的问题，增加了端口可绑定范围和重试逻辑。增加了报错反馈。
+
+
+
+# 以下为原repo内容：
+
 【停止维护说明】
 
 由于个人规划，该软件停止维护，如果有需要可以尝试一下付费版本，付费版本整体加强了开源版本的各种功能，稳定性更强，可定制化程度更高，欢迎大家尝试：<https://bh.keli.moe/>
@@ -9,7 +17,6 @@
 ![操作系统](https://img.shields.io/badge/%E6%93%8D%E4%BD%9C%E7%B3%BB%E7%BB%9F-Windows-yellow)
 [![爱发电](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fgithub.com%2FMiningCattiva%2Fsponsors%2Fraw%2Fmain%2Fsponsors.json&query=%24.count&suffix=%E4%BA%BA&label=%E7%88%B1%E5%8F%91%E7%94%B5&color=%23926be5)
 ](https://afdian.net/a/moyuscript)
-
 
 一个推特媒体（图片、视频）下载器。
 
